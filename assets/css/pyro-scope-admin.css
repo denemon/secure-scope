@@ -11,7 +11,7 @@
     border: 1px solid #ddd;
     text-align: left;
     word-wrap: break-word;
-    overflow-wrap: break-word; /* [L7] 長いパス名の表示崩れ防止 */
+    overflow-wrap: break-word;
 }
 
 .pyro-scope-results-table th {
@@ -48,4 +48,12 @@
 .pyro-scope-notice.error {
     background-color: #fbeaea;
     border-color: #dc3232;
+}
+
+.pyro-scope-saved-log pre {
+    max-height: 240px;
+    overflow: auto;
+    padding: 10px;
+    background: #f5f5f5;
+    border: 1px solid #ccc;
 }

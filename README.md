@@ -1,264 +1,230 @@
 # Pyro Scope
 
-WordPress security monitoring plugin. Companion to Pyro Shield.
+WordPress security monitoring plugin for file signatures, database content, core integrity, and plugin updates. It can run standalone or alongside Pyro Shield.
 
-**This is NOT a full vulnerability scanner.** It performs pattern-based detection of known malicious code signatures and does not guarantee detection of all threats.
+Pyro Scope is not a complete vulnerability scanner. A clean result means that every enabled check completed without matching the implemented rules; it does not guarantee that a site is malware-free.
 
-- **Stable tag:** 3.3
-- **License:** GPLv2 or later
-- **Contributors:** Ikkido-den (一揆堂田)
+- Stable tag: 3.5.2
+- License: GPLv2 or later
+- PHP: 8.1 or later
+- WordPress: 6.0 or later (tested through 7.0)
 
-## Requirements
+## Checks
 
-- PHP 8.1 or later
-- WordPress 6.0 or later (tested up to 6.7)
+### File scan
 
-## Features
+The scanner walks files under `ABSPATH` and inspects PHP-family files (`php`, `php3`, `php4`, `php5`, `php7`, `phtml`, `phar`, `phps`, and `inc`) plus JavaScript. It detects:
 
-### File Scanner
+- variable calls to command-execution functions;
+- obfuscated `eval` / `assert` calls;
+- request-input includes, evals, command execution, and PHP file writes;
+- uploaded-file moves to PHP destinations; and
+- PHP-family files in the resolved uploads directories.
 
-Scans PHP and JS files under ABSPATH for known malicious code patterns.
+Inert uploads guard files of at most 200 bytes are ignored only when they contain an opening tag, comments, and whitespace and produce no output. User-configured exclusions are matched at directory boundaries. No path is excluded by default.
 
-Detected signatures:
+File contents are read in 1 MB chunks with a 64 KB overlap. A request reads at most 16 MB and stores the current file offset and overlap tail, so one large file resumes in the next request. A file that changes between batches is reported as an error instead of being treated as clean.
 
-| Signature Name | Description |
-|---|---|
-| Variable Function Execution | Variable function calls to dangerous functions (passthru, shell_exec, system, exec, popen, proc_open) |
-| Obfuscated Eval | Concatenation-based obfuscation in eval/assert/preg_replace |
-| Advanced Obfuscation | eval/assert wrapping gzuncompress, gzinflate, base64_decode, str_rot13 |
-| File Upload Webshell | move_uploaded_file using $_FILES |
-| Remote Code Execution | include/require using $_GET (both statement and function-call form) |
-| Create Function Webshell | Usage of create_function() |
-| Eval Base64 Decode | Standalone eval(base64_decode(...)) calls |
-| User Input Include | include/require using $_REQUEST or $_POST (both statement and function-call form) |
-| User Input Eval | eval() using $_REQUEST or $_POST |
-| PHP File Write | file_put_contents writing to .php files |
-| PHP file in uploads directory | Any .php file located inside wp-content/uploads/ |
+### Database scan
 
-### Database Scanner
+The scanner checks published posts, regular WordPress options, and approved comments for:
 
-Scans published posts, wp_options, and approved comments for:
+- obfuscated code calls;
+- `javascript:` or `data:` script and iframe sources; and
+- inline event attributes on commonly abused HTML elements.
 
-| Pattern Name | Description |
-|---|---|
-| Malicious Script | `<script>` tag injection |
-| Obfuscated Code | eval, base64_decode, gzinflate, str_rot13 function calls |
-| Malicious Iframe | `<iframe>` tag injection |
+Ordinary script tags and HTTPS embeds are not findings. WordPress transient options are excluded because they are mutable caches, including Pyro Scope's own checksum cache.
 
-### Whitelist
+Rows use keyset pagination. The query reads 20,001 characters to identify values beyond the 20,000-character inline limit. Oversized values resume from a saved character offset in 100,000-character windows with a 2,000-character overlap, up to 20 windows per request. End-of-value and read failures are distinct states.
 
-Paths can be excluded from the file scan (e.g., Pyro Shield's plugin directory) to prevent false positives between companion plugins.
+### Core integrity
 
-### Auto Scan
+Local core files are compared with the locale-aware checksum table from WordPress.org. The scanner reports deleted, unreadable, modified, linked, and unexpected files under `wp-admin` and `wp-includes`; `wp-content` is excluded from core integrity.
 
-Weekly automatic scans via WP-Cron. Manual scans can also be triggered from the admin screen. Scan results are saved as JSON and the latest results are always displayed in the admin panel.
+The checksum table is validated, cached for one hour by WordPress version and locale, and reused across batches. Checksum comparison and unexpected-file traversal both resume from stored cursors.
 
-### Core File Integrity Check
+### Plugin updates
 
-Compares local WordPress core files against official checksums from the WordPress.org API. Reports modified or deleted core files. Files under wp-content/ are excluded from this check.
+The plugin calls WordPress's native update check and reads the standard `update_plugins` site transient. A missing timestamp, update response, or no-update response is an error and cannot be displayed as “no updates.” Plugins without a standard update provider may appear in neither response; Pyro Scope does not invent update status for them.
 
-### Plugin Vulnerability Check
+This is a version check, not a CVE or advisory feed. An available update does not necessarily mean that the installed version is vulnerable.
 
-Compares installed plugin versions against the latest versions available on WordPress.org. Reports plugins that are not up to date. This is a version comparison only; it does not check CVE databases or known vulnerability feeds.
+## Scan execution
 
-## Error Handling
+Manual scans use authenticated admin AJAX requests; weekly scans use WP-Cron. Enabled stages run in this order:
 
-- If the file scanner encounters an error during directory traversal (e.g., symbolic link loops, permission errors), the error message is recorded in the scan log and the scan is marked as incomplete via the `scan_incomplete` flag in the scan result data.
-- Errors are never silently suppressed. All caught exceptions during file scanning are logged.
-- Scan results are written to disk using `LOCK_EX` to prevent data corruption from concurrent writes.
+1. `integrity`
+2. `files`
+3. `db`
+4. `updates`
 
-## Scan Result Storage
+Manual and scheduled scans share a 15-minute lock and transient-backed session. Lock acquisition, expired-lock replacement, refresh, and release use compare-and-swap database operations. One process cannot overwrite or delete a replacement owner's lock.
 
-- Scan results are stored as JSON at `wp-content/uploads/pyro-scope-log/pyro-scope-scan.json`.
-- The log directory is protected by an `index.php` silence file and a `.htaccess` deny rule (Apache only).
-- Last scan timestamp is stored in `pyro_scope_last_scan_timestamp` (wp_options, autoload: no).
-- Plugin vulnerability check results are cached as transients (`pyro_scope_vuln_*`) with a 12-hour TTL.
+Each AJAX request runs one batch. A cron request runs as many batches as its wall-clock budget permits, stores progress after every batch, and schedules one continuation event when work remains. Activation schedules the first weekly run one week later. Deactivation removes the active session, lock, weekly event, and continuation events.
 
-## Limitations
+The per-batch time budget is half of PHP's `max_execution_time`, capped at 8 seconds and floored at 0.25 seconds. Unlimited runtimes use 8 seconds. External checksum requests use only the remaining batch time. The cron request budget defaults to half of `max_execution_time`, capped at 20 seconds, or 20 seconds when unlimited.
 
-- Pattern-based detection only. Obfuscation techniques not covered by the defined signatures will not be detected.
-- The file scanner skips files larger than 2 MB (2,097,152 bytes). Malicious code in files exceeding this limit will not be detected. This threshold prevents memory exhaustion on constrained hosting environments.
-- The database scanner skips option values larger than 100,000 bytes.
-- Core integrity check depends on WordPress.org API availability and only covers core files (not plugins or themes).
-- Plugin vulnerability check only compares version numbers against WordPress.org. Plugins not hosted on WordPress.org are not checked.
-- The file scanner only inspects files with `.php` or `.js` extensions.
-- Multisite environments are not explicitly supported. Each site must activate the plugin individually.
-- Automatic scans run weekly via WP-Cron. WP-Cron depends on site traffic and is not a reliable scheduler.
+## Limits and failure states
 
-## Security Considerations
+| Limit | Value |
+|---|---:|
+| Filesystem entries | 250,000 per scan |
+| Executable files | 50,000 per scan |
+| File content | 16 MB per request |
+| Database rows | 200 per batch |
+| Oversized DB windows | 20 per batch |
+| File findings | 1,000 per scan |
+| Database findings | 1,000 per scan |
+| Integrity findings | 1,000 per scan |
+| Unexpected core entries | 100,000 per scan |
+| File/core entries | 1,000 per batch |
 
-- Scan results may contain file paths and database content. The log directory is protected against HTTP access on Apache via `.htaccess`. Nginx environments require manual configuration to deny access to `wp-content/uploads/pyro-scope-log/`.
-- The AJAX scan endpoint requires `manage_options` capability and nonce verification.
-- This plugin does not modify or delete any detected files. It is detection and reporting only.
-- This plugin does not communicate with any external service other than the WordPress.org API.
-- Scan log lines in the admin UI are rendered as text nodes (`document.createTextNode`), not as HTML. This prevents interpretation of any HTML or script content that may appear in log messages (e.g., from exception messages containing file paths or user-influenced data).
-- Files larger than 2 MB are skipped without notification. An attacker could embed malicious code in a file exceeding this threshold to evade detection. This is an accepted trade-off to prevent memory exhaustion.
+Reaching a scan or finding limit marks the result incomplete. Directory and file read failures, unsafe symlinks, database query failures, disappearing oversized values, checksum API failures, incomplete update metadata, lost locks, and result-storage failures are also recorded as incomplete states. Disabled, clean, findings, failed, and incomplete results are rendered separately.
 
-## Assumptions
+A very large single directory must still be listed before its entries can be split into batches. A signature split by more than the configured file or database overlap can evade a match. Pattern rules cannot detect every obfuscation technique.
 
-- WordPress is installed in the standard directory structure with `wp-content/uploads/` as the uploads directory.
-- The `ABSPATH` constant accurately reflects the WordPress root directory.
-- The WordPress.org API is the authoritative source for core file checksums and plugin version information.
-- File system permissions allow the plugin to read files under ABSPATH and write to the uploads directory.
-- The `.htaccess` deny rule is only effective on Apache with `AllowOverride` enabled.
-- PHP and JS files containing malicious signatures are assumed to be smaller than 2 MB. Files exceeding this size are not scanned.
+## Configuration
 
-## Non-Goals
+The `pyro_scope_options` option contains only these keys:
 
-- This plugin does not perform runtime behavior analysis or sandboxing.
-- This plugin does not provide malware removal or file quarantine.
-- This plugin does not scan theme files for vulnerabilities.
-- This plugin does not integrate with CVE databases or vulnerability advisory feeds.
-- This plugin does not provide real-time file system monitoring (inotify or similar).
-- This plugin does not replace professional security auditing or penetration testing.
-- This plugin does not provide user authentication, login protection, or brute-force prevention (delegated to Pyro Shield).
-- This plugin does not provide WAF functionality (delegated to Pyro Shield).
+- `enable_scanner` — file and database checks (default: `1`)
+- `enable_integrity` — core checksum check (default: `1`)
+- `enable_updates` — plugin update check (default: `1`)
+- `whitelist_paths` — `ABSPATH`-relative file-scan exclusions (default: `[]`)
 
-## Pyro Shield Integration
+Whitelist input rejects absolute paths, drive-qualified paths, null bytes, and `.` / `..` traversal segments. A settings database failure is shown in the admin screen and does not update the in-memory configuration.
 
-Pyro Scope is designed as a companion to Pyro Shield.
+The `pyro_scope_cron_seconds` filter changes the wall-clock budget for one cron request. A value of `0` is useful for forcing exactly one batch per cron invocation in tests.
 
-- Login protection and WAF functionality are delegated to Pyro Shield and are not included in Pyro Scope.
-- Adding Pyro Shield's plugin directory to the whitelist prevents false positives between the two plugins.
+## Storage and cleanup
 
-## FAQ
+- Completed results: non-autoloaded `pyro_scope_last_scan_results` option
+- Last completed timestamp: non-autoloaded `pyro_scope_last_scan_timestamp` option
+- Active lock: non-autoloaded `pyro_scope_scan_lock` option
+- Partial sessions: 15-minute `pyro_scope_scan_*` transients
+- Core checksums: one-hour `pyro_scope_core_checksums` transient
+- Plugin updates: WordPress's native `update_plugins` site transient
 
-**Can I use Pyro Scope without Pyro Shield?**
-Yes. Pyro Scope works standalone. However, for login protection and advanced defense features, using it together with Pyro Shield is recommended.
+Uninstall removes settings, results, timestamps, locks, scan sessions, the checksum cache, and both cron hooks on every site in a multisite network. Pyro Scope never deletes or quarantines detected content.
 
-**Can I change the scan frequency?**
-In the current version, automatic scans are fixed to weekly. You can run a manual scan at any time using the "Run manual scan now" button in the admin screen.
+## Security boundaries
 
-**Are detected files automatically deleted?**
-No. Pyro Scope only detects and reports. File deletion or remediation must be performed manually by the administrator.
+- Every AJAX stage requires `manage_options`, a valid nonce, the random scan ID, and ownership of the active lock.
+- Result HTML escapes every dynamic value in the template.
+- Live log lines are inserted with `document.createTextNode`, not HTML.
+- Checksum paths cannot be absolute or contain traversal, drive, or null-byte components.
+- Symlinked directories are not traversed, and file symlinks cannot escape `ABSPATH`.
+- External communication is limited to WordPress.org core checksums and WordPress's native update mechanism.
+- Public requests return before plugin classes are loaded because Pyro Scope has no public hooks.
 
-**Is multisite supported?**
-The current version targets single-site installations. In multisite environments, the plugin must be activated individually on each site by the network administrator.
+## Installation and release build
 
-## Module Configuration
+1. Upload `pyro-scope-<version>.zip` in the WordPress plugin installer, or copy its `pyro-scope` directory into `wp-content/plugins/`.
+2. Activate Pyro Scope.
+3. Open the Pyro Scope admin page to configure and run a scan.
 
-Each feature can be toggled independently via the `pyro_scope_options` option:
+Build a production archive from the source checkout:
 
-- `enable_scanner` — File scan and DB scan (default: ON)
-- `enable_integrity` — Core file integrity check (default: ON)
-- `enable_vuln` — Plugin vulnerability check (default: ON)
-- `whitelist_paths` — Array of paths excluded from file scan (default: `['wp-content/plugins/pyro-shield']`)
-
-## Installation
-
-1. Upload the `pyro-scope` folder to `wp-content/plugins/`.
-2. Activate the plugin from the WordPress admin Plugins page.
-3. Access "Pyro Scope" from the admin menu to run scans and view results.
-
-## Tests
-
-This plugin includes a small PHPUnit test suite under `tests/`. The tests use a minimal WordPress stub bootstrap, so a full WordPress test environment or database is not required.
-
-1. Install development dependencies:
-
+```sh
+./bin/build-release.sh
 ```
+
+The archive has a top-level `pyro-scope` directory. `.distignore` excludes tests, Composer files and dependencies, release archives, repository metadata, agent instructions, local settings, and OS metadata.
+
+Verify that the production ZIP installs, activates, runs, deactivates, and
+uninstalls cleanly across the supported WordPress/PHP environments:
+
+```sh
+npm run test:release
+```
+
+The final audit also exercises lock, transient, deactivation, and uninstall
+behavior against Redis 7.4 and Redis Object Cache 2.8.0:
+
+```sh
+npm run test:object-cache
+```
+
+## Development
+
+Install and run the PHP 8.1-compatible PHPUnit suite:
+
+```sh
 composer install
+composer check
 ```
 
-2. Run the full test suite from the plugin root:
+Run the real WordPress matrix and Plugin Check in disposable Docker environments:
 
-```
-./vendor/bin/phpunit
-```
-
-3. Optional: run a single test file:
-
-```
-./vendor/bin/phpunit tests/PyroScopeTest.php
+```sh
+npm install
+npm run check
 ```
 
-`phpunit.xml.dist` is loaded automatically, so no extra options are required for the default test run.
+The runtime matrix covers WordPress 7.0.2 with PHP 8.4 on a single site and
+WordPress 6.0.12 with PHP 8.1 on multisite. It verifies activation,
+deactivation, hooks, conditional assets, non-autoloaded settings, concurrent
+real-MySQL locking and replacement-owner protection, transient sessions,
+Plugin Check, and a clean WordPress debug log.
 
-### Nginx Configuration
+The current suite contains 35 tests and 139 assertions. It covers initialization, assets, result states and saved logs, malformed stored data, settings failures, whitelist validation, large-file byte-offset resumption, file traversal state, DB errors and pagination, transient exclusion, oversized-value resumption and end detection, checksum validation and traversal, lock races, cron continuation, AJAX cleanup, and update-metadata completeness.
 
-Add the following to deny HTTP access to the scan log directory:
+Phase 3 browser acceptance covers authenticated settings submission, a complete
+multi-request manual scan, lock-conflict recovery, ARIA progress state, browser
+console output, and desktop/mobile-width layouts against the real wp-env site.
+Phase 4 release acceptance installs the generated production ZIP into clean
+single-site and multisite environments and verifies its complete lifecycle.
+Phase 5 runs the concurrency and lifecycle gates with Redis Object Cache and
+verifies the final persisted state after uninstall.
+Phase 6 assigns a new patch version and verifies that repeated release builds
+produce the same archive hash.
 
-```
-location ~* /wp-content/uploads/pyro-scope-log/ {
-    deny all;
-    return 403;
-}
-```
+Production responsibilities are separated as follows:
 
-## Upgrade Notice
+| File | Responsibility |
+|---|---|
+| `pyro-scope.php` | Header, context guard, class loading, lifecycle hooks, boot |
+| `src/class-plugin.php` | Object composition, WordPress hooks, and site-aware lifecycle |
+| `src/class-settings.php` | Supported options, validation, persisted keys |
+| `src/class-scan-session.php` | CAS lock and resumable session storage |
+| `src/class-scan-runner.php` | Step order, accumulated state, result persistence |
+| `src/class-scan-controller.php` | AJAX and WP-Cron lifecycle |
+| `src/class-admin-page.php` | Admin menu, assets, settings, page rendering |
+| `src/class-results-renderer.php` | Escaped result rendering boundary |
+| `src/class-file-scanner.php` | Resumable filesystem scan |
+| `src/class-db-scanner.php` | Resumable posts/options/comments scan |
+| `src/class-integrity-scanner.php` | Resumable WordPress core integrity scan |
+| `src/class-update-scanner.php` | Native plugin update check |
 
-- **3.3:** Breaking change — Plugin renamed from Pyre Scope to Pyro Scope. All identifiers, file names, and log paths updated. Settings from 3.2 are not migrated.
-- **3.2:** Code quality improvements. No breaking changes.
-- **3.1:** Breaking change — Simple WAF feature removed. Use Pyro Shield for WAF functionality.
-- **3.0:** Breaking change — All internal identifiers renamed from `pyreopsis` to `pyro_scope`. Settings from previous versions are not migrated. Re-check your settings after upgrading.
-- **2.8:** Contains security fixes (AJAX permission check, PHP 8.1+ compatibility, information leak prevention). Immediate update recommended for all users.
+## Upgrade notes
+
+Version 3.5.2 requires no settings migration. Its first automatic weekly scan
+is scheduled one week after activation instead of running immediately.
+
+Version 3.5.1 intentionally removes obsolete compatibility paths. The former `enable_vuln` setting is replaced by `enable_updates`, the default whitelist is empty, old result shapes are not rendered, and pre-3.x public JSON logs are not migrated. Re-save settings and run a fresh scan after upgrading.
 
 ## Changelog
 
-### 3.3
+### 3.5.2
 
-- **Breaking:** Renamed plugin from Pyre Scope to Pyro Scope. All internal identifiers updated (`pyre_scope_*` → `pyro_scope_*`, `pyre-scope-*` → `pyro-scope-*`, `PyreScopeAjax` → `PyroScopeAjax`). Plugin file renamed from `pyre-scope.php` to `pyro-scope.php`. Asset files renamed accordingly.
-- **Breaking:** Renamed log directory from `fspo-log` to `pyro-scope-log` and log file from `fspo-scan.json` to `pyro-scope-scan.json`.
-- **Breaking:** Renamed companion plugin references from Pyre Shield to Pyro Shield. Default whitelist path updated from `wp-content/plugins/pyre-shield` to `wp-content/plugins/pyro-shield`.
+- Delayed the first weekly scan until one week after activation to prevent it from competing with an initial manual scan.
+- Added browser, real-MySQL concurrency, persistent Redis cache, and clean release-install verification.
+- Verified that deactivation preserves completed data and uninstall removes plugin data across multisite.
+- Made repeated release builds produce byte-identical ZIP archives.
 
-### 3.2
+### 3.5.1
 
-- Removed unused `scan_schedule` option from defaults (was defined but never referenced)
-- Removed unreachable `return` statement after `wp_send_json_error()` in AJAX handler
-- Refactored `file_scan()` to return a structured result array instead of using pass-by-reference for error reporting
-- Deferred log directory initialization to first use (`get_log_file_path()`), eliminating unnecessary file I/O on frontend and non-scan requests
-- Added `whitelist_paths` to Module Configuration documentation
+- Removed the legacy public-log migration, old cache cleanup, test-only synchronous scan APIs, redundant Composer archive configuration, stale release archives, and unused test stubs.
+- Renamed the update stage and setting from vulnerability terminology to `updates` / `enable_updates`.
+- Removed the default Pyro Shield exclusion and fixed absolute-path whitelist validation.
+- Made file content, oversized DB values, checksum comparison, and unexpected-core traversal resumable within explicit time, byte, item, and finding limits.
+- Fixed same-second lock refreshes, refresh/release races, empty DB chunk handling, transient-cache self-scanning, incomplete update metadata, settings write errors, and checksum path validation.
+- Stopped loading plugin classes on ordinary public requests and excluded development instructions from release archives.
 
-### 3.1
+### 3.5.0
 
-- **Breaking:** Removed Simple WAF feature entirely (delegated to Pyro Shield). Removed `run_waf()`, `waf_check_value()`, `enable_waf` option, and all associated hooks and patterns.
+- Added wall-clock batch budgets, resumable core checksum comparison, keyset DB scanning, CAS lock acquisition, and multisite uninstall cleanup.
 
-### 3.0
+### 3.4.0
 
-- **Breaking:** Renamed all internal identifiers from `pyreopsis` to `pyre_scope` (subsequently renamed to `pyro_scope` in 3.3).
-- **Breaking:** Removed phantom filter hook documentation (`pyreopsis_allow_login_protection`, `pyreopsis_is_login_endpoint`) — no implementation existed.
-- Removed obsolete option keys from uninstall cleanup.
-
-### 2.9.1
-
-- Fixed stored XSS risk in admin JS log rendering; log lines are now inserted as text nodes instead of HTML
-- Extended `include/require` detection signatures to match both function-call form (`include(...)`) and statement form (`include ...`)
-- Added 2 MB file size limit to file scanner; files exceeding 2,097,152 bytes are skipped to prevent memory exhaustion
-
-### 2.9
-
-- Added file scanner signature: `eval(base64_decode(...))` standalone detection
-- Added file scanner signature: `include/require/eval` using `$_REQUEST` or `$_POST`
-- Added file scanner signature: `file_put_contents` writing `.php` files
-- Added file scanner rule: flag any `.php` file inside `wp-content/uploads/` as suspicious
-- Fixed silent error suppression in file scanner catch block; errors are now logged and scan is marked incomplete
-- Added `LOCK_EX` to scan result file writing to prevent concurrent write corruption
-
-### 2.8
-
-- Added `current_user_can('manage_options')` permission check to AJAX scan handler
-- Fixed global timezone pollution from `date_default_timezone_set()` (replaced with `wp_date()`)
-- Fixed missing vulnerability check results in HTML output
-- Fixed `$wpdb->get_results()` null return TypeError on PHP 8.0+
-- Fixed asset file path references
-- Unified plugin name to Pyro Scope
-- Added PHP 8.1 type declarations to all properties
-- Changed `catch (Exception)` to `catch (\Throwable)`
-- Improved DB scan to query `option_value` directly
-- Added `.htaccess` to log directory
-- Set `update_option` autoload to `false` for scan timestamp
-- Added `JSON_UNESCAPED_UNICODE` to JSON encoding
-- Added strict comparison to `in_array` calls
-- Replaced `strpos` with `str_starts_with`
-- Changed activation/deactivation hooks to static closures
-- Added type-safe guard for `whitelist_paths`
-- Applied `urlencode()` to `check_vuln` URL
-- Added transient cache cleanup on uninstall
-
-### 2.7
-
-- Initial release
-
-## Developer Notes
-
-The default signatures are conservatively tuned. For production environments, integrating an auto-update mechanism that fetches signed signature packs from a trusted feed is recommended.
+- Moved results into private WordPress options, split manual and scheduled work into stages, adopted native plugin-update metadata, expanded signature coverage, and added production ZIP packaging.

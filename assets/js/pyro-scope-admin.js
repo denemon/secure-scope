@@ -1,76 +1,88 @@
 jQuery(document).ready(function($) {
-    'use strict'; // [L8]
+    'use strict';
 
-    // [FIXED] セレクタ・ローカライズオブジェクト名・AJAXアクション名を pyro-scope / PyroScopeAjax に変更
-    // スキャンボタンがクリックされたときの処理
     $('#pyro-scope-run-scan').on('click', function() {
-        // 各UI要素を定数として定義
         const scanButton = $(this);
         const log = $('#pyro-scope-scan-log');
         const progressBar = $('#pyro-scope-progress-bar');
         const progressContainer = $('#pyro-scope-progress-container');
+        const results = $('#pyro-scope-results-container');
+        let scanId = '';
 
-        // --- スキャン開始時のUI初期化 ---
         scanButton.prop('disabled', true);
-        log.text('Scan initialized...');
-        $('#pyro-scope-results-container').html(''); // 前回のリザルトをクリア
+        log.text('Scan initialized...\n');
+        results.empty();
         progressContainer.show();
-        progressBar.css('width', '0%').css('background-color', '#0a0');
+        progressBar.css('width', '0%').css('background-color', '#0a0').attr('aria-valuenow', '0');
 
-        // --- Ajaxリクエストの実行 ---
-        $.ajax({
-            // wp_localize_scriptでPHPから渡されたオブジェクトを使用
-            url: PyroScopeAjax.ajax_url,
-            type: 'POST',
-            dataType: 'json',
-            data: {
-                action: 'pyro_scope_run_scan',
-                _ajax_nonce: PyroScopeAjax.nonce // セキュリティトークン
-            },
-            success: function(resp) {
-                if (resp.success) {
-                    // 成功した場合、レスポンス内のHTMLを結果表示エリアに描画
-                    $('#pyro-scope-results-container').html(resp.data.html);
-
-                    const lines = resp.data.log;
-                    const total = lines.length;
-                    log.text('');
-
-                    // ログが空の場合のエッジケース対応
-                    if (total === 0) {
-                        log[0].appendChild(document.createTextNode('--- Scan Complete (no log entries) ---\n'));
-                        scanButton.prop('disabled', false);
-                        return;
-                    }
-
-                    lines.forEach(function(line, i) {
-                        setTimeout(function() {
-                            // [v2.9.1] createTextNodeでHTML解釈を防止（XSS対策）
-                            log[0].appendChild(document.createTextNode(line + '\n'));
-                            progressBar.css('width', Math.round((i + 1) / total * 100) + '%');
-                            log.scrollTop(log[0].scrollHeight);
-
-                            if (i + 1 === total) {
-                                log[0].appendChild(document.createTextNode('--- Scan Complete ---\n'));
-                                log.scrollTop(log[0].scrollHeight);
-                                scanButton.prop('disabled', false); // ボタンを再度有効化
-                            }
-                        }, i * 100);
-                    });
-                } else {
-                    // サーバーからエラーが返された場合
-                    const errorMessage = (resp.data && resp.data.message) ? resp.data.message : 'An unknown error occurred on the server.';
-                    log.text('Scan failed: ' + errorMessage);
-                    progressBar.css('width', '100%').css('background-color', '#d9534f');
-                    scanButton.prop('disabled', false);
+        function request(step) {
+            return $.ajax({
+                url: PyroScopeAjax.ajax_url,
+                type: 'POST',
+                dataType: 'json',
+                data: {
+                    action: 'pyro_scope_run_scan',
+                    _ajax_nonce: PyroScopeAjax.nonce,
+                    step: step,
+                    scan_id: scanId
                 }
-            },
-            error: function(jqXHR, textStatus, errorThrown) {
-                // 通信自体が失敗した場合
-                log.text('Communication error: ' + textStatus + ' - ' + errorThrown);
-                progressBar.css('width', '100%').css('background-color', '#d9534f');
+            });
+        }
+
+        function appendLines(lines) {
+            lines.forEach(function(line) {
+                log[0].appendChild(document.createTextNode(line + '\n'));
+            });
+            log.scrollTop(log[0].scrollHeight);
+        }
+
+        function fail(jqXHR, textStatus, errorThrown) {
+            const response = jqXHR.responseJSON;
+            const message = response && response.data && response.data.message
+                ? response.data.message
+                : textStatus + (errorThrown ? ' - ' + errorThrown : '');
+
+            appendLines(['Scan failed: ' + message]);
+            progressBar.css('width', '100%').css('background-color', '#d9534f').attr('aria-valuenow', '100');
+            if (scanId) {
+                request('cancel').always(function() {
+                    scanButton.prop('disabled', false);
+                });
+            } else {
                 scanButton.prop('disabled', false);
             }
-        });
+        }
+
+        function finish() {
+            request('finish').done(function(resp) {
+                results.html(resp.data.html);
+                appendLines([resp.data.incomplete ? '--- Scan Incomplete ---' : '--- Scan Complete ---']);
+                progressBar.css('width', '100%').attr('aria-valuenow', '100');
+                if (resp.data.incomplete) {
+                    progressBar.css('background-color', '#d9534f');
+                }
+                scanButton.prop('disabled', false);
+            }).fail(fail);
+        }
+
+        function runSteps(steps, index) {
+            if (index >= steps.length) {
+                finish();
+                return;
+            }
+
+            request(steps[index]).done(function(resp) {
+                appendLines(resp.data.log);
+                const nextIndex = resp.data.step_complete ? index + 1 : index;
+                const progress = Math.round(nextIndex / (steps.length + 1) * 100);
+                progressBar.css('width', progress + '%').attr('aria-valuenow', progress);
+                runSteps(steps, nextIndex);
+            }).fail(fail);
+        }
+
+        request('start').done(function(resp) {
+            scanId = resp.data.scan_id;
+            runSteps(resp.data.steps, 0);
+        }).fail(fail);
     });
 });

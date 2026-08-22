@@ -1,5 +1,32 @@
 {
+    "name": "ikkido-den/pyro-scope",
+    "description": "WordPress security monitoring plugin for file, database, core integrity, and plugin update checks.",
+    "type": "wordpress-plugin",
+    "license": "GPL-2.0-or-later",
+    "require": {
+        "php": ">=8.1"
+    },
     "require-dev": {
-        "yoast/phpunit-polyfills": "^4"
+        "dealerdirect/phpcodesniffer-composer-installer": "^1.1",
+        "phpcompatibility/phpcompatibility-wp": "^2.1",
+        "phpunit/phpunit": "^10.5",
+        "wp-coding-standards/wpcs": "^3.4"
+    },
+    "config": {
+        "allow-plugins": {
+            "dealerdirect/phpcodesniffer-composer-installer": true
+        }
+    },
+    "scripts": {
+        "security": "composer audit --locked --abandoned=report",
+        "syntax": "find . -path './vendor' -prune -o -name '*.php' -type f -print0 | xargs -0 -n1 php -l",
+        "test": "phpunit",
+        "lint": "phpcs",
+        "check": [
+            "@security",
+            "@syntax",
+            "@lint",
+            "@test"
+        ]
     }
 }

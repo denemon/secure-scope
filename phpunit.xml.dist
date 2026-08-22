@@ -2,6 +2,7 @@
 <phpunit
     bootstrap="tests/bootstrap.php"
     colors="true"
+    cacheResult="false"
     beStrictAboutTestsThatDoNotTestAnything="true"
 >
     <testsuites>

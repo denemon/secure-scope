@@ -3,6 +3,11 @@
 
 # Track .gitignore itself
 !.gitignore
+!.distignore
+!.wp-env.json
+!.wp-env.wp60.json
 
 # Composer dev dependencies
 /vendor/
+/node_modules/
+/pyro-scope-*.zip

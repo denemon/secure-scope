@@ -1,0 +1,13 @@
+{
+    "$schema": "https://schemas.wp.org/trunk/wp-env.json",
+    "core": "https://wordpress.org/wordpress-6.0.12.zip",
+    "phpVersion": "8.1",
+    "plugins": ["."],
+    "multisite": true,
+    "testsEnvironment": false,
+    "config": {
+        "WP_DEBUG": true,
+        "WP_DEBUG_LOG": true,
+        "WP_DEBUG_DISPLAY": false
+    }
+}

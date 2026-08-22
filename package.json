@@ -1,0 +1,14 @@
+{
+    "name": "pyro-scope-development",
+    "private": true,
+    "scripts": {
+        "wp-env": "wp-env",
+        "test:runtime": "bash bin/test-runtime.sh",
+        "test:object-cache": "bash bin/test-object-cache.sh",
+        "test:release": "bash bin/test-release.sh",
+        "check": "npm audit --audit-level=high && node --check assets/js/pyro-scope-admin.js && npm run test:runtime && npm run test:object-cache && npm run test:release"
+    },
+    "devDependencies": {
+        "@wordpress/env": "11.8.0"
+    }
+}

@@ -19,6 +19,14 @@ if (!defined('HOUR_IN_SECONDS')) {
     define('HOUR_IN_SECONDS', 3600);
 }
 
+if (!defined('WEEK_IN_SECONDS')) {
+    define('WEEK_IN_SECONDS', 604800);
+}
+
+if (!defined('WP_CONTENT_DIR')) {
+    define('WP_CONTENT_DIR', rtrim(ABSPATH, '/\\') . '/wp-content');
+}
+
 if (!class_exists('WP_Error')) {
     class WP_Error
     {
@@ -27,6 +35,75 @@ if (!class_exists('WP_Error')) {
             public string $message = ''
         ) {
         }
+    }
+}
+
+final class Pyro_Scope_Test_WPDB
+{
+    public string $posts = 'wp_posts';
+    public string $options = 'wp_options';
+    public string $comments = 'wp_comments';
+    public string $last_error = '';
+    /** @var list<mixed> */
+    public array $prepared_args = [];
+
+    public function prepare(string $query, mixed ...$args): string
+    {
+        $this->prepared_args = $args;
+        return $query;
+    }
+
+    public function query(string $query): int|false
+    {
+        $before_query = $GLOBALS['pyro_scope_test_wp']['before_db_query'] ?? null;
+        if (is_callable($before_query)) {
+            $before_query($query);
+        }
+
+        // ロック取得と同じ原子性を再現する: 既存行があれば INSERT IGNORE は 0 行。
+        if (str_starts_with($query, 'INSERT IGNORE INTO `wp_options`')) {
+            [$key, $serialized_value] = $this->prepared_args;
+            if (array_key_exists((string) $key, $GLOBALS['pyro_scope_test_wp']['options'])) {
+                return 0;
+            }
+            $GLOBALS['pyro_scope_test_wp']['options'][(string) $key] = maybe_unserialize((string) $serialized_value);
+            return 1;
+        }
+
+        if (str_starts_with($query, 'DELETE FROM `wp_options`')) {
+            [$key, $serialized_old] = $this->prepared_args;
+            $current = get_option((string) $key, false);
+            if (maybe_serialize($current) !== $serialized_old) {
+                return 0;
+            }
+            unset($GLOBALS['pyro_scope_test_wp']['options'][(string) $key]);
+            return 1;
+        }
+
+        if (!str_starts_with($query, 'UPDATE `wp_options`')) {
+            return 0;
+        }
+        [$serialized_new, $key, $serialized_old] = $this->prepared_args;
+        $current = get_option((string) $key, false);
+        if (maybe_serialize($current) !== $serialized_old) {
+            return 0;
+        }
+        if ($serialized_new === $serialized_old) {
+            return 0;
+        }
+        $GLOBALS['pyro_scope_test_wp']['options'][(string) $key] = unserialize((string) $serialized_new);
+        return 1;
+    }
+
+    /** @return list<object> */
+    public function get_results(string $query): array
+    {
+        return [];
+    }
+
+    public function get_var(string $query): ?string
+    {
+        return null;
     }
 }
 
@@ -41,20 +118,27 @@ function pyro_scope_test_reset_wordpress_state(): void
     $GLOBALS['pyro_scope_test_wp'] = [
         'options'            => [],
         'actions'            => [],
+        'filters'            => [],
         'styles'             => [],
         'scripts'            => [],
         'localized_scripts'  => [],
         'menu_pages'         => [],
         'scheduled'          => [],
-        'activation_hooks'   => [],
-        'deactivation_hooks' => [],
+        // プラグイン本体は一度しか require されないので、登録済みフックは保持する。
+        'activation_hooks'   => $GLOBALS['pyro_scope_test_plugin_hooks']['activation_hooks'] ?? [],
+        'deactivation_hooks' => $GLOBALS['pyro_scope_test_plugin_hooks']['deactivation_hooks'] ?? [],
         'site_transients'    => [],
         'transients'         => [],
         'plugins'            => [],
         'remote_get'         => null,
+        'update_plugins'     => null,
+        'update_option_failures' => [],
+        'before_db_query'    => null,
         'current_user_can'   => true,
         'ajax_response'      => null,
     ];
+    $GLOBALS['wpdb'] = new Pyro_Scope_Test_WPDB();
+    $GLOBALS['wp_local_package'] = '';
 
     wp_mkdir_p(ABSPATH . 'wp-content/uploads');
     wp_mkdir_p(ABSPATH . 'wp-content/plugins');
@@ -128,7 +212,7 @@ function register_deactivation_hook(string $file, callable $callback): void
     $GLOBALS['pyro_scope_test_wp']['deactivation_hooks'][$file] = $callback;
 }
 
-function wp_next_scheduled(string $hook): bool
+function wp_next_scheduled(string $hook, array $args = []): bool
 {
     return isset($GLOBALS['pyro_scope_test_wp']['scheduled'][$hook]);
 }
@@ -143,9 +227,28 @@ function wp_schedule_event(int $timestamp, string $recurrence, string $hook): bo
     return true;
 }
 
-function wp_clear_scheduled_hook(string $hook): void
+function wp_schedule_single_event(int $timestamp, string $hook, array $args = []): bool
 {
+    $GLOBALS['pyro_scope_test_wp']['scheduled'][$hook][] = compact('timestamp', 'args');
+    return true;
+}
+
+function wp_unschedule_hook(string $hook): int
+{
+    $removed = count((array) ($GLOBALS['pyro_scope_test_wp']['scheduled'][$hook] ?? []));
     unset($GLOBALS['pyro_scope_test_wp']['scheduled'][$hook]);
+
+    return $removed;
+}
+
+function is_admin(): bool
+{
+    return true;
+}
+
+function wp_doing_cron(): bool
+{
+    return false;
 }
 
 function add_action(string $hook, callable|array|string $callback, int $priority = 10, int $accepted_args = 1): bool
@@ -157,6 +260,22 @@ function add_action(string $hook, callable|array|string $callback, int $priority
     ];
 
     return true;
+}
+
+function add_filter(string $hook, callable $callback, int $priority = 10, int $accepted_args = 1): bool
+{
+    $GLOBALS['pyro_scope_test_wp']['filters'][$hook][] = $callback;
+
+    return true;
+}
+
+function apply_filters(string $hook, mixed $value, mixed ...$args): mixed
+{
+    foreach ($GLOBALS['pyro_scope_test_wp']['filters'][$hook] ?? [] as $callback) {
+        $value = $callback($value, ...$args);
+    }
+
+    return $value;
 }
 
 function has_action(string $hook, callable|array|string $callback): int|false
@@ -172,6 +291,9 @@ function has_action(string $hook, callable|array|string $callback): int|false
 
 function add_option(string $key, mixed $value, string $deprecated = '', string $autoload = 'yes'): bool
 {
+    if (array_key_exists($key, $GLOBALS['pyro_scope_test_wp']['options'])) {
+        return false;
+    }
     $GLOBALS['pyro_scope_test_wp']['options'][$key] = $value;
     return true;
 }
@@ -183,6 +305,9 @@ function get_option(string $key, mixed $default = false): mixed
 
 function update_option(string $key, mixed $value, mixed $autoload = null): bool
 {
+    if (in_array($key, $GLOBALS['pyro_scope_test_wp']['update_option_failures'], true)) {
+        return false;
+    }
     $GLOBALS['pyro_scope_test_wp']['options'][$key] = $value;
     return true;
 }
@@ -212,11 +337,6 @@ function add_menu_page(
     ];
 
     return $menu_slug;
-}
-
-function plugin_dir_path(string $file): string
-{
-    return rtrim(dirname($file), '/\\') . '/';
 }
 
 function plugin_dir_url(string $file): string
@@ -267,6 +387,11 @@ function admin_url(string $path = ''): string
 function wp_create_nonce(string $action): string
 {
     return 'nonce-' . $action;
+}
+
+function sanitize_key(string $key): string
+{
+    return preg_replace('/[^a-z0-9_\-]/', '', strtolower($key)) ?? '';
 }
 
 function sanitize_textarea_field(string $text): string
@@ -322,10 +447,12 @@ function wp_send_json_error(array $value = [], ?int $status_code = null): never
     throw new RuntimeException('wp_send_json_error');
 }
 
-function wp_upload_dir(): array
+function wp_upload_dir(?string $time = null, bool $create_dir = true): array
 {
     $basedir = rtrim(ABSPATH, '/\\') . '/wp-content/uploads';
-    wp_mkdir_p($basedir);
+    if ($create_dir) {
+        wp_mkdir_p($basedir);
+    }
 
     return [
         'basedir' => $basedir,
@@ -345,6 +472,11 @@ function wp_mkdir_p(string $target): bool
 function wp_normalize_path(string $path): string
 {
     return str_replace('\\', '/', $path);
+}
+
+function add_query_arg(array $args, string $url): string
+{
+    return $url . '?' . http_build_query($args);
 }
 
 function esc_html(string $text): string
@@ -419,21 +551,17 @@ function get_plugins(): array
     return $GLOBALS['pyro_scope_test_wp']['plugins'];
 }
 
+function wp_update_plugins(): void
+{
+    $handler = $GLOBALS['pyro_scope_test_wp']['update_plugins'];
+    if (is_callable($handler)) {
+        $handler();
+    }
+}
+
 function get_site_transient(string $key): mixed
 {
     return $GLOBALS['pyro_scope_test_wp']['site_transients'][$key] ?? false;
-}
-
-function set_site_transient(string $key, mixed $value, int $expiration = 0): bool
-{
-    $GLOBALS['pyro_scope_test_wp']['site_transients'][$key] = $value;
-    return true;
-}
-
-function delete_site_transient(string $key): bool
-{
-    unset($GLOBALS['pyro_scope_test_wp']['site_transients'][$key]);
-    return true;
 }
 
 function get_transient(string $key): mixed
@@ -447,6 +575,34 @@ function set_transient(string $key, mixed $value, int $expiration = 0): bool
     return true;
 }
 
+function delete_transient(string $key): bool
+{
+    unset($GLOBALS['pyro_scope_test_wp']['transients'][$key]);
+    return true;
+}
+
+function maybe_serialize(mixed $value): string
+{
+    return is_array($value) || is_object($value) ? serialize($value) : (string) $value;
+}
+
+function maybe_unserialize(string $value): mixed
+{
+    $restored = @unserialize($value);
+
+    return $restored === false && $value !== serialize(false) ? $value : $restored;
+}
+
+function wp_cache_delete(string $key, string $group = ''): bool
+{
+    return true;
+}
+
 pyro_scope_test_reset_wordpress_state();
 
 require_once dirname(__DIR__) . '/pyro-scope.php';
+
+$GLOBALS['pyro_scope_test_plugin_hooks'] = [
+    'activation_hooks'   => $GLOBALS['pyro_scope_test_wp']['activation_hooks'],
+    'deactivation_hooks' => $GLOBALS['pyro_scope_test_wp']['deactivation_hooks'],
+];
